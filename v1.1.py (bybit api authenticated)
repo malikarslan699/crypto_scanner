@@ -1,0 +1,206 @@
+from pybit.unified_trading import HTTP
+import pandas as pd
+import pandas_ta as ta
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+import numpy as np
+import logging
+import asyncio
+import time
+from datetime import datetime, timedelta
+
+# Configuration
+API_KEY = "qN3MG3kfIWhfeLIldB"
+API_SECRET = "7Uk5wQKAshUeYilFwytz7AhAQU0hLwrtba30"
+TESTNET = True
+
+TIMEFRAMES = ['5', '15', '60', '240', 'D']
+SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'XRPUSDT', 'ADAUSDT', 'SOLUSDT']
+SCAN_INTERVAL = 300  # 5 minutes
+
+# Logging setup
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Initialize session
+session = HTTP(testnet=TESTNET, api_key=API_KEY, api_secret=API_SECRET)
+
+# Machine Learning model
+model = RandomForestClassifier(n_estimators=100, random_state=42)
+
+def fetch_ohlcv(symbol, interval, limit=1000):
+    try:
+        end_time = int(time.time() * 1000)
+        start_time = end_time - (limit * get_interval_ms(interval))
+        
+        kline_data = session.get_kline(
+            category="linear",
+            symbol=symbol,
+            interval=interval,
+            start=start_time,
+            end=end_time,
+            limit=limit
+        )
+        
+        if 'retCode' in kline_data and kline_data['retCode'] != 0:
+            logger.error(f"Error fetching OHLCV data: {kline_data['retMsg']}")
+            return None
+        
+        df = pd.DataFrame(kline_data['result']['list'], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'].astype(int), unit='ms')
+        df.set_index('timestamp', inplace=True)
+        df = df.astype(float)
+        return df.iloc[::-1]
+    except Exception as e:
+        logger.error(f"Error fetching OHLCV for {symbol} on {interval}: {str(e)}")
+        return None
+
+def get_interval_ms(interval):
+    if interval == 'D':
+        return 24 * 60 * 60 * 1000
+    return int(interval) * 60 * 1000
+
+def calculate_indicators(df):
+    df['sma_20'] = ta.sma(df['close'], length=20)
+    df['sma_50'] = ta.sma(df['close'], length=50)
+    df['rsi'] = ta.rsi(df['close'], length=14)
+    macd = ta.macd(df['close'])
+    df['macd'] = macd['MACD_12_26_9']
+    df['macd_signal'] = macd['MACDs_12_26_9']
+    df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+    return df
+
+def prepare_ml_data(df):
+    df['target'] = np.where(df['close'].shift(-1) > df['close'], 1, 0)
+    features = ['sma_20', 'sma_50', 'rsi', 'macd', 'macd_signal', 'atr']
+    
+    # Drop NaN values
+    df_clean = df.dropna()
+    
+    X = df_clean[features].values
+    y = df_clean['target'].values
+    
+    # Remove last row from X and y as we don't have target for the last data point
+    return X[:-1], y[:-1]
+
+async def train_model(symbol, interval):
+    df = fetch_ohlcv(symbol, interval)
+    if df is None or len(df) < 200:
+        logger.warning(f"Insufficient data for {symbol} on {interval}")
+        return False
+    
+    df = calculate_indicators(df)
+    X, y = prepare_ml_data(df)
+    
+    logger.info(f"Prepared data for {symbol} on {interval}. X shape: {X.shape}, y shape: {y.shape}")
+    
+    if len(X) < 100:
+        logger.warning(f"Not enough samples for {symbol} on {interval} after preprocessing")
+        return False
+    
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    model.fit(X_train, y_train)
+    accuracy = model.score(X_test, y_test)
+    logger.info(f"Model trained for {symbol} on {interval}. Accuracy: {accuracy:.2f}")
+    return True
+
+def predict_signal(df):
+    features = ['sma_20', 'sma_50', 'rsi', 'macd', 'macd_signal', 'atr']
+    X = df[features].iloc[-1].values.reshape(1, -1)
+    prediction = model.predict(X)
+    probability = model.predict_proba(X)[0]
+    return "BUY" if prediction[0] == 1 else "SELL", max(probability)
+
+def analyze_market_structure(df):
+    current_price = df['close'].iloc[-1]
+    sma_20 = df['sma_20'].iloc[-1]
+    sma_50 = df['sma_50'].iloc[-1]
+    
+    if current_price > sma_20 > sma_50:
+        return "Bullish"
+    elif current_price < sma_20 < sma_50:
+        return "Bearish"
+    else:
+        return "Neutral"
+
+def calculate_risk_reward(df, signal):
+    atr = df['atr'].iloc[-1]
+    current_price = df['close'].iloc[-1]
+    
+    if signal == "BUY":
+        stop_loss = current_price - 2 * atr
+        take_profit = current_price + 3 * atr
+    else:
+        stop_loss = current_price + 2 * atr
+        take_profit = current_price - 3 * atr
+    
+    return stop_loss, take_profit
+
+async def analyze_coin(symbol, interval):
+    df = fetch_ohlcv(symbol, interval)
+    if df is None:
+        return None
+    
+    df = calculate_indicators(df)
+    
+    signal, probability = predict_signal(df)
+    market_structure = analyze_market_structure(df)
+    stop_loss, take_profit = calculate_risk_reward(df, signal)
+    
+    current_price = df['close'].iloc[-1]
+    rsi = df['rsi'].iloc[-1]
+    macd = df['macd'].iloc[-1]
+    
+    analysis = {
+        "symbol": symbol,
+        "interval": interval,
+        "price": current_price,
+        "signal": signal,
+        "probability": probability,
+        "market_structure": market_structure,
+        "rsi": rsi,
+        "macd": macd,
+        "stop_loss": stop_loss,
+        "take_profit": take_profit
+    }
+    
+    return analysis
+
+def format_analysis(analysis):
+    return f"""
+{analysis['symbol']} | {analysis['interval']} | Signal: {analysis['signal']} (Prob: {analysis['probability']:.2f})
+Price: {analysis['price']:.2f} | Structure: {analysis['market_structure']}
+RSI: {analysis['rsi']:.2f} | MACD: {analysis['macd']:.4f}
+Stop Loss: {analysis['stop_loss']:.2f} | Take Profit: {analysis['take_profit']:.2f}
+"""
+
+async def scan_market():
+    tasks = []
+    for symbol in SYMBOLS:
+        for interval in TIMEFRAMES:
+            tasks.append(analyze_coin(symbol, interval))
+    
+    results = await asyncio.gather(*tasks)
+    strong_signals = [r for r in results if r and r['probability'] > 0.7]
+    
+    if strong_signals:
+        logger.info("Strong signals detected:")
+        for signal in strong_signals:
+            logger.info(format_analysis(signal))
+    else:
+        logger.info("No strong signals detected in this scan.")
+
+async def main():
+    logger.info("Starting Advanced Crypto Scanner (Testnet)")
+    
+    # Initial model training
+    logger.info("Training initial models...")
+    training_tasks = [train_model(symbol, '60') for symbol in SYMBOLS]
+    await asyncio.gather(*training_tasks)
+    
+    while True:
+        await scan_market()
+        await asyncio.sleep(SCAN_INTERVAL)
+
+if __name__ == "__main__":
+    asyncio.run(main())
